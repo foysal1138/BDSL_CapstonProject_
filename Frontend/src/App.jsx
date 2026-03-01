@@ -1,23 +1,30 @@
-import React, { Suspense, lazy } from "react";
-import { WSProvider } from "./services/websocket";
+﻿import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import Login from './pages/Login';
+import SignUp from './pages/SignUp';
+import ForgotPassword from './pages/ForgotPassword';
+import DoctorDashboard from './pages/DoctorDashboard';
+import PatientRegistration from './pages/PatientRegistration';
+import Profile from './pages/Profile';
 
-const PatientDashboard = lazy(() => import("./components/PatientDashboard.jsx"));
-const DoctorDashboard = lazy(() => import("./components/DoctorDashboard.jsx"));
+function ProtectedRoute({ children }) {
+  const auth = localStorage.getItem('auth');
+  return auth ? children : <Navigate to="/login" replace />;
+}
 
 function App() {
-    return (
-        <WSProvider>
-            <div className="app-container">
-                <h1 className="title">🏥 Hospital Communication Dashboard</h1>
-                <Suspense fallback={<div>Loading dashboards...</div>}>
-                    <div className="dashboard-grid">
-                        <PatientDashboard />
-                        <DoctorDashboard />
-                    </div>
-                </Suspense>
-            </div>
-        </WSProvider>
-    );
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/login" element={<Login />} />
+        <Route path="/signup" element={<SignUp />} />
+        <Route path="/forgot-password" element={<ForgotPassword />} />
+        <Route path="/dashboard" element={<ProtectedRoute><DoctorDashboard /></ProtectedRoute>} />
+        <Route path="/patient-registration" element={<ProtectedRoute><PatientRegistration /></ProtectedRoute>} />
+        <Route path="/profile" element={<ProtectedRoute><Profile /></ProtectedRoute>} />
+        <Route path="*" element={<Navigate to="/login" replace />} />
+      </Routes>
+    </BrowserRouter>
+  );
 }
 
 export default App;
