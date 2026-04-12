@@ -1,0 +1,26 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Web Framework & Server
+fastapi
+uvicorn
+python-dotenv
+
+# Database & ORM
+sqlalchemy
+
+# Data Validation
+pydantic
+
+# Scientific & Image Processing
+numpy
+opencv-python
+Pillow
+
+# Deep Learning
+torch
+torchvision
+torchaudio
+
+# Utilities
+requests
+cryptography
