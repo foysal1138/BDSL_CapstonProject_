@@ -1,259 +1,235 @@
-"""Sign language recognition FastAPI backend with WebSocket predictions."""
-
-import base64
+import pickle
 import cv2
-import logging
-import os
-from collections import deque
-from datetime import datetime
-
+import mediapipe as mp
 import numpy as np
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
+import base64
+import uuid
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from sqlalchemy.orm import Session
-
-from database import init_db, get_db, User, Prediction, Session as SessionModel
-from schemas import LoginRequest, LoginResponse, UserCreate, UserResponse, HealthResponse
-from auth import hash_password, verify_password, generate_token, get_token_expiry
-from huggingface.inference import (
-    CLASS_NAMES, IMG_SIZE, NUM_CLASSES, SEQUENCE_LENGTH, device, model,
-    preprocess_frames, predict_sign,
-)
-from patients import router as patient_router
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-app = FastAPI(
-    title="Sign Language Recognition API",
-    description="Real-time CNN-LSTM based sign language recognition",
-    version="1.0.0"
+import threading
+from database.db import (
+    init_db,
+    insert_prediction,
+    get_patient,
+    insert_patient,
+    get_all_patients,
+    get_predictions,
+    create_user,
+    verify_user,
+    get_user_by_email,
 )
 
-app.include_router(patient_router)
+app = FastAPI()
 
-allowed_origins = [
-    origin.strip() for origin in os.getenv(
-        "ALLOWED_ORIGINS", "http://localhost:5000,http://127.0.0.1:5000"
-    ).split(",") if origin.strip()
-]
-allowed_hosts = [
-    host.strip() for host in os.getenv(
-        "ALLOWED_HOSTS", "localhost,127.0.0.1"
-    ).split(",") if host.strip()
-]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
-app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+model_dict = pickle.load(open('./model.p', 'rb'))
+model = model_dict['model']
+
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(static_image_mode=False, min_detection_confidence=0.5)
+
+labels_dict = {0: '0', 1: '1', 2: '2', 3: '3', 4: '4', 5: '5', 6: '6', 7: '7', 8: '8', 9: '9'}
+classes = list(labels_dict.values())
+current_prediction = "Waiting..."
+prediction_lock = threading.Lock()
+
+
+def predict_from_frame(frame):
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(frame_rgb)
+    if not results.multi_hand_landmarks:
+        return None
+
+    hand_landmarks = results.multi_hand_landmarks[0]
+    x_ = []
+    y_ = []
+    data_aux = []
+
+    for point in hand_landmarks.landmark:
+        x_.append(point.x)
+        y_.append(point.y)
+
+    for point in hand_landmarks.landmark:
+        data_aux.append(point.x - min(x_))
+        data_aux.append(point.y - min(y_))
+
+    prediction = model.predict([np.asarray(data_aux)])
+    predicted_character = labels_dict[int(prediction[0])]
+    return predicted_character
+
 
 @app.on_event("startup")
-async def startup_event():
-    init_db()  # Initialize database tables
-    logger.info(f"Device: {device} | Model: {model is not None} | Classes: {CLASS_NAMES}")
-
-
-def get_current_user(token: str, db: Session = Depends(get_db)) -> User:
-    """Validate token and return authenticated user."""
-    session = db.query(SessionModel).filter(
-        SessionModel.token == token,
-        SessionModel.is_active == True
-    ).first()
-    
-    if not session or session.expires_at < datetime.utcnow():
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token"
-        )
-    
-    return session.user
-
-
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Check API and model status."""
-    return {
-        "status": "ok",
-        "model_loaded": model is not None,
-        "device": str(device),
-        "sequence_length": SEQUENCE_LENGTH,
-        "num_classes": NUM_CLASSES,
-        "classes": CLASS_NAMES,
-    }
+async def startup():
+    init_db()
 
 
 @app.get("/")
 async def root():
-    """API metadata and endpoints."""
     return {
-        "message": "Sign Language Recognition API",
-        "version": "1.0.0",
-        "endpoints": {
-            "health": "/health",
-            "auth": {
-                "signup": "POST /auth/signup",
-                "login": "POST /auth/login",
-            },
-            "predictions": {
-                "history": "GET /predictions/history",
-                "websocket": "WS /ws/predict"
-            }
-        }
+        "status": "ok",
+        "message": "BDSL backend is running",
     }
 
 
-@app.post("/auth/signup", response_model=UserResponse)
-async def signup(user_data: UserCreate, db: Session = Depends(get_db)):
-    """Register doctor account."""
-    # Prevent duplicate email registration
-    existing_user = db.query(User).filter(User.email == user_data.email).first()
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "model_loaded": model is not None,
+        "classes": classes,
+        "sequence_length": 16,
+        "num_classes": len(classes),
+        "device": "cpu",
+    }
+
+
+@app.get("/prediction")
+async def get_prediction():
+    with prediction_lock:
+        return {"prediction": current_prediction}
+
+
+@app.post("/patients")
+async def create_patient(data: dict):
+    try:
+        patient_id = insert_patient(
+            data["tracking_id"],
+            data["first_name"],
+            data["last_name"],
+            data["gender"],
+            data["age"],
+            data["date_of_birth"],
+            data["address"],
+            data["nid_birth_cert"],
+            data["blood_group"]
         )
-    
-    db_user = User(
-        email=user_data.email,
-        password=hash_password(user_data.password),
-        role=user_data.role,
-        is_active=True
-    )
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    
-    logger.info(f"New user registered: {user_data.email}")
-    return db_user
+        return {"id": patient_id, "message": "Patient created"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/auth/login", response_model=LoginResponse)
-async def login(credentials: LoginRequest, db: Session = Depends(get_db)):
-    """Authenticate and return session token."""
-    # Verify email and password
-    db_user = db.query(User).filter(User.email == credentials.email).first()
-    if not db_user or not verify_password(credentials.password, db_user.password):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
-    
-    if not db_user.is_active:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is inactive")
-    
-    # Generate session token
-    token = generate_token()
-    db_session = SessionModel(
-        user_id=db_user.id,
-        token=token,
-        expires_at=get_token_expiry(),
-        is_active=True
-    )
-    db.add(db_session)
-    db.commit()
-    
-    logger.info(f"User logged in: {credentials.email}")
-    
+@app.post("/patients/register")
+async def register_patient(data: dict):
+    try:
+        tracking_id = f"PT-{uuid.uuid4().hex[:10].upper()}"
+        patient_id = insert_patient(
+            tracking_id,
+            data["first_name"],
+            data["last_name"],
+            data["gender"],
+            data["age"],
+            data["date_of_birth"],
+            data["address"],
+            data["nid_birth_cert"],
+            data["blood_group"],
+        )
+        return {"id": patient_id, "tracking_id": tracking_id, "message": "Patient registered"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/patients")
+async def list_patients():
+    return get_all_patients()
+
+
+@app.get("/patients/{tracking_id}")
+async def get_patient_info(tracking_id: str):
+    patient = get_patient(tracking_id)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    return patient
+
+
+@app.post("/predictions")
+async def save_prediction(data: dict):
+    try:
+        insert_prediction(
+            data["user_id"],
+            data["detected_sign"],
+            data["confidence"],
+            data.get("probabilities")
+        )
+        return {"message": "Prediction saved"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/predictions/{user_id}")
+async def get_user_predictions(user_id: int):
+    return get_predictions(user_id)
+
+
+@app.post("/auth/signup")
+async def signup(data: dict):
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+    role = data.get("role", "doctor")
+
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required")
+    if get_user_by_email(email):
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    user_id = create_user(email, password, role)
+    return {"id": user_id, "email": email, "role": role}
+
+
+@app.post("/auth/login")
+async def login(data: dict):
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+    user = verify_user(email, password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = f"token-{uuid.uuid4().hex}"
     return {
         "access_token": token,
-        "user": db_user,
-        "message": "Login successful"
-    }
-
-
-@app.get("/predictions/history")
-async def get_prediction_history(
-    token: str, limit: int = 50, db: Session = Depends(get_db)
-):
-    """Get user prediction history."""
-    user = get_current_user(token, db)
-    
-    predictions = db.query(Prediction).filter(
-        Prediction.user_id == user.id
-    ).order_by(Prediction.timestamp.desc()).limit(limit).all()
-    
-    return {
-        "user_id": user.id,
-        "total_predictions": len(predictions),
-        "predictions": predictions
-    }
-
-
-def create_base_response(frame_count, buffer_len):
-    """Build buffer status response."""
-    status_str = f"{buffer_len}/{SEQUENCE_LENGTH}"
-    return {
-        "frame_count": frame_count,
-        "buffer_size": buffer_len,
-        "buffer_status": status_str,
-        "prediction": f"Accumulating frames... ({status_str})",
+        "token_type": "bearer",
+        "user": {"id": user["id"], "email": user["email"], "role": user["role"]},
     }
 
 
 @app.websocket("/ws/predict")
-async def websocket_predict(websocket: WebSocket):
-    """Real-time sign prediction via WebSocket: receive frames → buffer → predict."""
+async def ws_predict(websocket: WebSocket):
+    global current_prediction
     await websocket.accept()
-    logger.info("Client connected")
-    
-    frame_buffer, frame_count = deque(maxlen=SEQUENCE_LENGTH), 0
-    
     try:
         while True:
-            # Receive base64 frame
-            data = await websocket.receive_text()
-            encoded = data.split(",", 1)[1] if "," in data else data
-            
-            try:
-                # Decode and convert to numpy array
-                img = cv2.imdecode(
-                    np.frombuffer(base64.b64decode(encoded), np.uint8),
-                    cv2.IMREAD_COLOR
-                )
-                
-                if img is None:
-                    await websocket.send_json({"error": "Invalid image data"})
-                    continue
-                
-                # Add frame to buffer (auto-removes oldest if full)
-                frame_buffer.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-                frame_count += 1
-                response = create_base_response(frame_count, len(frame_buffer))
-                
-                # Run inference when buffer is full
-                if len(frame_buffer) == SEQUENCE_LENGTH:
-                    frames_tensor = preprocess_frames(list(frame_buffer))
-                    
-                    if frames_tensor is None:
-                        response.update({"prediction": "Preprocessing failed", "status": "error"})
-                    elif model is None:
-                        response.update({"prediction": "Model not loaded", "status": "error"})
-                    else:
-                        # Run CNN-LSTM inference
-                        pred = predict_sign(frames_tensor)
-                        if pred:
-                            final_pred = f"{pred['predicted_text']} ({pred['confidence']})"
-                            response.update({
-                                "prediction": final_pred,
-                                "confidence": pred["confidence"],
-                                "class": pred["predicted_class"],
-                                "probabilities": pred["all_probabilities"],
-                                "status": "success",
-                                "description": pred["description"],
-                            })
-                        else:
-                            response.update({"prediction": "Prediction failed", "status": "error"})
-                
-                await websocket.send_json(response)
-            
-            except (base64.binascii.Error, ValueError) as e:
-                await websocket.send_json({"error": f"Invalid frame data: {e}", "status": "error"})
-            except Exception as e:
-                await websocket.send_json({"error": f"Processing error: {e}", "status": "error"})
-    
+            data_url = await websocket.receive_text()
+            if "," in data_url:
+                data_url = data_url.split(",", 1)[1]
+
+            frame_bytes = base64.b64decode(data_url)
+            frame_np = np.frombuffer(frame_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
+
+            if frame is None:
+                await websocket.send_json({"status": "error", "message": "Invalid frame"})
+                continue
+
+            prediction = predict_from_frame(frame)
+            if prediction is None:
+                await websocket.send_json({"status": "success", "prediction": ""})
+            else:
+                with prediction_lock:
+                    current_prediction = prediction
+                await websocket.send_json({"status": "success", "prediction": prediction})
     except WebSocketDisconnect:
-        pass
+        return
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        await websocket.send_json({"status": "error", "message": str(e)})
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8760)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # uvicorn.run(app, host="0.0.0.0", port=8760)
