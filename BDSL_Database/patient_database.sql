@@ -1,0 +1,2 @@
+CREATE DATABASE BDSL_Database;
+USE BDSL_Database;
